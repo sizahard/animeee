@@ -1,0 +1,97 @@
+# 🌸 Daily Anime Fact Generator
+# Scheduled at 14:00 UTC or manually triggered
+
+name: anime-fact-daily
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 20 * * *"  # 2 PM UTC daily
+
+env:
+  MODEL_NAME: qwen3:0.6b
+  FACT_FILE: anime-facts.txt
+  API_ENDPOINT: http://localhost:11434
+
+jobs:
+  fetch-anime-fact:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 📦 Initialize Ollama
+        run: |
+          command -v ollama >/dev/null 2>&1 || {
+            echo "→ Installing Ollama runtime..."
+            curl -fsSL https://ollama.com/install.sh | sh
+          }
+
+      - name: 🎌 Generate Anime Fact
+        id: fact-gen
+        run: |
+          # Start Ollama service in background
+          ollama serve > /tmp/ollama.log 2>&1 &
+          
+          # Wait for API availability with timeout
+          for attempt in {1..30}; do
+            curl -s "${API_ENDPOINT}/api/tags" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          
+          # Verify model is available
+          ollama list 2>/dev/null | grep -q "${MODEL_NAME}" || {
+            echo "→ Downloading ${MODEL_NAME}..."
+            ollama pull "${MODEL_NAME}"
+          }
+          
+          # Request anime fact via API
+          RAW=$(curl -s "${API_ENDPOINT}/api/generate" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"${MODEL_NAME}\",
+              \"prompt\": \"Share one interesting, concise fact about anime (series, industry, culture, or history). Output ONLY the raw sentence—no quotes, no line breaks, no extra text.\",
+              \"stream\": false,
+              \"options\": { \"temperature\": 0.8 }
+            }" | jq -r '.response // empty')
+          
+          # Clean and normalize the output
+          FACT=$(printf '%s' "$RAW" | \
+            tr -d '\r\t' | \
+            sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/^["'\'']+|["'\'']+$//g; s/^[[:space:]]+|[[:space:]]+$//g; s/[[:space:]]{2,}/ /g')
+          
+          # Validate result
+          if [[ -z "$FACT" || "${#FACT}" -lt 10 ]]; then
+            echo "❌ Failed to generate valid anime fact"
+            exit 1
+          fi
+          
+          echo "✨ Generated: ${FACT:0:70}..."
+          {
+            echo "anime_fact<<ANIME_DELIM"
+            printf '%s\n' "$FACT"
+            echo "ANIME_DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 🗃️ Commit Fact to Repo
+        if: steps.fact-gen.outputs.anime_fact != ''
+        run: |
+          NEW_FACT="${{ steps.fact-gen.outputs.anime_fact }}"
+          
+          # Set git identity to repository owner
+          git config --global user.name "${{ github.repository_owner }}"
+          git config --global user.email "${{ github.repository_owner }}@users.noreply.github.com"
+          
+          # Append fact to collection file
+          echo "$NEW_FACT" >> "${{ env.FACT_FILE }}"
+          
+          # Stage, commit, and push
+          git add "${{ env.FACT_FILE }}"
+          git commit -m "✨ anime fact: ${NEW_FACT:0:45}..."
+          git push origin HEAD
+          
+          echo "✅ Successfully added fact to ${{ env.FACT_FILE }}"
